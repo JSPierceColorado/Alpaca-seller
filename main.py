@@ -1,13 +1,19 @@
 import os
 import time
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from typing import List, Optional
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
+
+# NEW: minimal imports to fetch SPY bars and compute MAs
+import pandas as pd
+from alpaca.data import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # -----------------------
 # Config
@@ -17,6 +23,9 @@ API_SECRET = os.environ.get("APCA_API_SECRET_KEY")
 PAPER = os.environ.get("APCA_PAPER", "true").lower() in ("1", "true", "yes")
 RUN_EVERY_SECONDS = int(os.environ.get("RUN_EVERY_SECONDS", "3600"))  # check once per hour by default
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.05"))    # 5% default
+
+# NEW: bars needed to compute 15m MA240 safely
+BARS_NEEDED = int(os.environ.get("BARS_NEEDED", "300"))
 
 ET_TZ = ZoneInfo("America/New_York")
 
@@ -89,6 +98,46 @@ def sell_all(trading: TradingClient, symbol: str, qty_str: str):
         logger.error(f"Failed to submit SELL for {symbol}: {e}")
 
 
+# NEW --------------------
+# Broad market gate: allow sells only if SPY 15m MA60 > MA240
+def spy_uptrend_gate(data_client: StockHistoricalDataClient) -> bool:
+    """
+    Returns True only if SPY's 15m MA60 > MA240 at the latest bar.
+    If data is missing/insufficient, returns False (block sells).
+    """
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=15 * (BARS_NEEDED + 5))
+        req = StockBarsRequest(
+            symbol_or_symbols="SPY",
+            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+            start=start,
+            end=end,
+            limit=BARS_NEEDED,
+            feed="sip",
+        )
+        bars = data_client.get_stock_bars(req)
+        sb = bars.data.get("SPY", [])
+        if not sb or len(sb) < 240:
+            logger.info("SPY has insufficient 15m bars for MA240; blocking sells this cycle.")
+            return False
+
+        closes = pd.Series([float(b.close) for b in sb], index=[b.timestamp for b in sb])
+        ma60 = closes.rolling(window=60, min_periods=60).mean().iloc[-1]
+        ma240 = closes.rolling(window=240, min_periods=240).mean().iloc[-1]
+        if pd.isna(ma60) or pd.isna(ma240):
+            logger.info("SPY MA values not ready; blocking sells this cycle.")
+            return False
+
+        ok = ma60 > ma240
+        logger.info(f"SPY market gate (sell): MA60={ma60:.4f} vs MA240={ma240:.4f} -> {'ALLOW SELLS' if ok else 'BLOCK SELLS'}")
+        return ok
+    except Exception as e:
+        logger.warning(f"SPY uptrend gate check failed ({e}); blocking sells this cycle.")
+        return False
+# -----------------------
+
+
 # -----------------------
 # Core loop
 # -----------------------
@@ -98,8 +147,14 @@ def run_once():
         raise RuntimeError("APCA_API_KEY_ID and APCA_API_SECRET_KEY must be set.")
 
     trading = TradingClient(API_KEY, API_SECRET, paper=PAPER)
+    data_client = StockHistoricalDataClient(API_KEY, API_SECRET)  # NEW
 
     if not is_trading_hours(trading):
+        return
+
+    # NEW: check broad market before selling
+    if not spy_uptrend_gate(data_client):
+        logger.info("Market gate not satisfied (SPY MA60 <= MA240). Skipping all sells this cycle.")
         return
 
     positions = get_positions(trading)
