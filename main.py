@@ -27,6 +27,9 @@ TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.05"))    # 5% defau
 # NEW: bars needed to compute 15m MA240 safely
 BARS_NEEDED = int(os.environ.get("BARS_NEEDED", "300"))
 
+# NEW: choose data feed, default to IEX for free/paper accounts; set to "sip" if you have access
+DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex").lower()
+
 ET_TZ = ZoneInfo("America/New_York")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -104,26 +107,54 @@ def spy_uptrend_gate(data_client: StockHistoricalDataClient) -> bool:
     """
     Returns True only if SPY's 15m MA60 > MA240 at the latest bar.
     If data is missing/insufficient, returns False (block sells).
+    Tries the configured DATA_FEED first (default 'iex'), then falls back to 'iex' if needed.
     """
     try:
         end = datetime.now(timezone.utc)
         start = end - timedelta(minutes=15 * (BARS_NEEDED + 5))
-        req = StockBarsRequest(
+
+        base_req = dict(
             symbol_or_symbols="SPY",
             timeframe=TimeFrame(15, TimeFrameUnit.Minute),
             start=start,
             end=end,
             limit=BARS_NEEDED,
-            feed="sip",
         )
-        bars = data_client.get_stock_bars(req)
-        sb = bars.data.get("SPY", [])
-        if not sb or len(sb) < 240:
+
+        # try configured feed first, then fall back to iex if different
+        try_feeds: List[str] = [DATA_FEED]
+        if DATA_FEED != "iex":
+            try_feeds.append("iex")
+
+        sb = []
+        last_err = None
+        for feed in try_feeds:
+            try:
+                req = StockBarsRequest(**base_req, feed=feed)
+                bars = data_client.get_stock_bars(req)
+                sb = bars.data.get("SPY", [])
+                if sb:
+                    logger.info(f"Fetched {len(sb)} SPY 15m bars via feed='{feed}'.")
+                    break
+                else:
+                    logger.warning(f"No bars returned from feed='{feed}'.")
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Fetching SPY via feed='{feed}' failed: {e}")
+
+        if not sb:
+            if last_err:
+                logger.warning(f"All feeds failed; blocking sells this cycle. Last error: {last_err}")
+            else:
+                logger.info("No bars returned; blocking sells this cycle.")
+            return False
+
+        if len(sb) < 240:
             logger.info("SPY has insufficient 15m bars for MA240; blocking sells this cycle.")
             return False
 
         closes = pd.Series([float(b.close) for b in sb], index=[b.timestamp for b in sb])
-        ma60 = closes.rolling(window=60, min_periods=60).mean().iloc[-1]
+        ma60  = closes.rolling(window=60,  min_periods=60).mean().iloc[-1]
         ma240 = closes.rolling(window=240, min_periods=240).mean().iloc[-1]
         if pd.isna(ma60) or pd.isna(ma240):
             logger.info("SPY MA values not ready; blocking sells this cycle.")
